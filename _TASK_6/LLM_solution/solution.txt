@@ -1,0 +1,1114 @@
+Du:
+## TASK 6A – Implement Code for NormGrossAnnualPrem()
+
+*(Premium calculation 1 of 4, Implementation)*
+
+1. **Goal**: Recreate the Excel-Formula for the premium calculation in python
+
+2. **Input for LLM**
+   - excelcell.csv & excelrange.csv to extract the formula  
+
+3. **Input for the script**
+   • basfunct.py  
+   • CSVs: var.csv, tariff.csv, limits.csv, tables.csv
+   • excelcell.csv & excelrange.csv
+
+4. **Output of the script**
+   • Function NormGrossAnnualPrem(sa, age, sex, n, t, PayFreq, tariff) in outfunc.py
+
+5. **Procedure**
+   • Formula exactly as in Calculation!K5 (“Bxt”).
+   • Dependencies: - Variables → var.csv - Tariff/Limits → tariff.csv, limits.csv - Base functions → basfunct.py.
+   • Do not leave placeholders (pass).
+
+6. **Success Check**
+
+   Test the results internally to make sure that the implementation ist correct.
+
+   **Reference input**
+
+   | sa      | age | sex | n  | t  | PayFreq | tariff |
+   | ------- | --- | --- | -- | -- | ------- | ------ |
+   | 100 000 | 40  | "M" | 30 | 20 | 12      | "KLV"  |
+
+   **Expected value**
+
+   | Function              | Expected       | Tolerance  |
+   | --------------------- | -------------- | ---------- |
+   | NormGrossAnnualPrem() | **0.04226001** | ± 1 × 10⁻⁸ |
+
+ChatGPT:
+
+Nachgedacht für 54s
+# outfunc.py
+"""
+AUSFUNCT_T1 – Premium calculations (direct Python implementation, no eval)
+
+Implements Excel Calculation sheet cells:
+  - K5 (Bxt):  NormGrossAnnualPrem(...)
+  - K6 (BJB):  GrossAnnualPrem(...)
+  - K7 (BZB):  GrossModalPrem(...)
+  - K9 (Pxt):  Pxt(...)
+
+Data sources:
+  - var.csv (defaults for x, Sex, n, t, SumInsured, PayFreq)
+  - tariff.csv (InterestRate, MortalityTable, alpha, beta1, gamma1, gamma2, k, ...)
+  - limits.csv (not used here, but available for later functions)
+  - tables.csv (used indirectly via basfunct Act_qx etc.)
+  - tariff.py (ModalSurcharge(PayFreq))
+
+Important:
+  - Formulas are defined once in code (no runtime parsing / eval of Excel strings).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import pandas as pd
+
+import basfunct
+import tariff as tariff_mod
+
+
+# -----------------------------
+# File resolution + caching
+# -----------------------------
+def _path(name: str) -> Path:
+    p = Path(name)
+    if p.exists():
+        return p
+    p2 = Path("/mnt/data") / name
+    if p2.exists():
+        return p2
+    raise FileNotFoundError(f"Missing required file: {name} (searched CWD and /mnt/data)")
+
+
+_CSV_CACHE: Dict[str, pd.DataFrame] = {}
+
+
+def _read_csv_cached(name: str) -> pd.DataFrame:
+    if name not in _CSV_CACHE:
+        _CSV_CACHE[name] = pd.read_csv(_path(name), dtype=str, encoding="utf-8")
+    return _CSV_CACHE[name]
+
+
+def _load_name_value(name: str) -> Dict[str, str]:
+    df = _read_csv_cached(name)
+    if "Name" not in df.columns or "Value" not in df.columns:
+        raise ValueError(f"{name} must have columns Name, Value")
+    out: Dict[str, str] = {}
+    for k, v in zip(df["Name"].astype(str), df["Value"].astype(str)):
+        kk = k.strip()
+        if kk:
+            out[kk] = (v if v is not None else "").strip()
+    return out
+
+
+def _parse_number(x: Any) -> float:
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+    # strip optional quotes
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1].strip()
+    # tolerate decimal comma if ever present
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    return float(s)
+
+
+def _inputs(
+    sa: float,
+    age: int,
+    sex: str,
+    n: int,
+    t: int,
+    PayFreq: int,
+    tariff: str,
+) -> Dict[str, Any]:
+    """
+    Load defaults from var.csv + tariff.csv, then override with function args.
+    """
+    var = _load_name_value("var.csv")
+    tar = _load_name_value("tariff.csv")
+    _ = _load_name_value("limits.csv")  # present for completeness
+
+    x = int(_parse_number(var.get("x", 0)))
+    Sex = str(var.get("Sex", "M")).strip()
+    n_val = int(_parse_number(var.get("n", 0)))
+    t_val = int(_parse_number(var.get("t", 0)))
+    SumInsured = _parse_number(var.get("SumInsured", sa))
+    PayFreq0 = int(_parse_number(var.get("PayFreq", PayFreq)))
+
+    # override with args
+    x = int(age)
+    Sex = str(sex).strip()
+    n_val = int(n)
+    t_val = int(t)
+    SumInsured = float(sa)
+    PayFreq0 = int(PayFreq)
+
+    InterestRate = _parse_number(tar["InterestRate"])
+    MortalityTable = str(tar["MortalityTable"]).strip()
+    alpha = _parse_number(tar["alpha"])
+    beta1 = _parse_number(tar["beta1"])
+    gamma1 = _parse_number(tar["gamma1"])
+    gamma2 = _parse_number(tar["gamma2"])
+    k = _parse_number(tar.get("k", 0.0))
+
+    return {
+        "x": x,
+        "Sex": Sex,
+        "n": n_val,
+        "t": t_val,
+        "SumInsured": SumInsured,
+        "PayFreq": PayFreq0,
+        "tariff": str(tariff),
+        "InterestRate": float(InterestRate),
+        "MortalityTable": MortalityTable,
+        "alpha": float(alpha),
+        "beta1": float(beta1),
+        "gamma1": float(gamma1),
+        "gamma2": float(gamma2),
+        "k": float(k),
+    }
+
+
+# -----------------------------
+# Excel cell formulas (direct)
+# -----------------------------
+def NormGrossAnnualPrem(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """
+    Excel Calculation!K5 (Bxt)
+
+    =(act_nGrAx(x,n,Sex,MortalityTable,InterestRate)
+      +Act_Dx(x+n,...)/Act_Dx(x,...)
+      +gamma1*Act_axn_k(x,t,...,1)
+      +gamma2*(Act_axn_k(x,n,...,1)-Act_axn_k(x,t,...,1)))
+     /((1-beta1)*Act_axn_k(x,t,...,1)-alpha*t)
+    """
+    inp = _inputs(sa, age, sex, n, t, PayFreq, tariff)
+
+    x = inp["x"]
+    Sex = inp["Sex"]
+    n_val = inp["n"]
+    t_val = inp["t"]
+    mt = inp["MortalityTable"]
+    ir = inp["InterestRate"]
+    alpha = inp["alpha"]
+    beta1 = inp["beta1"]
+    gamma1 = inp["gamma1"]
+    gamma2 = inp["gamma2"]
+
+    num = (
+        basfunct.act_nGrAx(x, n_val, Sex, mt, ir)
+        + basfunct.Act_Dx(x + n_val, Sex, mt, ir) / basfunct.Act_Dx(x, Sex, mt, ir)
+        + gamma1 * basfunct.Act_axn_k(x, t_val, Sex, mt, ir, 1)
+        + gamma2 * (basfunct.Act_axn_k(x, n_val, Sex, mt, ir, 1) - basfunct.Act_axn_k(x, t_val, Sex, mt, ir, 1))
+    )
+    den = (1.0 - beta1) * basfunct.Act_axn_k(x, t_val, Sex, mt, ir, 1) - alpha * t_val
+    return float(num / den)
+
+
+def GrossAnnualPrem(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """
+    Excel Calculation!K6 (BJB)
+    =SumInsured*K5
+    """
+    bxt = NormGrossAnnualPrem(sa, age, sex, n, t, PayFreq, tariff)
+    return float(sa * bxt)
+
+
+def Pxt(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """
+    Excel Calculation!K9 (Pxt)
+
+    =(act_nGrAx(x,n,Sex,MortalityTable,InterestRate)
+      +Act_Dx(x+n,...)/Act_Dx(x,...)
+      +t*alpha*NormGrossAnnualPrem)
+     /Act_axn_k(x,t,...,1)
+    """
+    inp = _inputs(sa, age, sex, n, t, PayFreq, tariff)
+
+    x = inp["x"]
+    Sex = inp["Sex"]
+    n_val = inp["n"]
+    t_val = inp["t"]
+    mt = inp["MortalityTable"]
+    ir = inp["InterestRate"]
+    alpha = inp["alpha"]
+
+    bxt = NormGrossAnnualPrem(sa, age, sex, n, t, PayFreq, tariff)
+
+    num = basfunct.act_nGrAx(x, n_val, Sex, mt, ir) + basfunct.Act_Dx(x + n_val, Sex, mt, ir) / basfunct.Act_Dx(
+        x, Sex, mt, ir
+    ) + t_val * alpha * bxt
+    den = basfunct.Act_axn_k(x, t_val, Sex, mt, ir, 1)
+    return float(num / den)
+
+
+def GrossModalPrem(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """
+    Excel Calculation!K7 (BZB)
+    =(1+ModalSurcharge)/PayFreq*(K6+k)
+
+    Notes:
+      - 'k' comes from tariff.csv
+      - 'ModalSurcharge' is the modal surcharge factor; in Python we compute it as ModalSurcharge(PayFreq)
+    """
+    inp = _inputs(sa, age, sex, n, t, PayFreq, tariff)
+    k = inp["k"]
+    payfreq = inp["PayFreq"]
+
+    bjb = GrossAnnualPrem(sa, age, sex, n, t, PayFreq, tariff)
+    modal_surcharge = float(tariff_mod.ModalSurcharge(payfreq))
+
+    return float((1.0 + modal_surcharge) / payfreq * (bjb + k))
+
+Du:
+## TASK 6B – Implement Code for the Test
+
+   Use the reference input and the expected values from Task 6A and create the test code.
+
+   *LLM creates tests/test_NormGrossAnnualPrem.py that checks this single case.
+   Passing = pytest -q shows a green test.*
+
+ChatGPT:
+# tests/test_NormGrossAnnualPrem.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path when running this file directly:
+#   python tests/test_NormGrossAnnualPrem.py
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from outfunc import NormGrossAnnualPrem  # noqa: E402
+
+
+def test_norm_gross_annual_prem_reference_case() -> None:
+    got = NormGrossAnnualPrem(
+        sa=100_000,
+        age=40,
+        sex="M",
+        n=30,
+        t=20,
+        PayFreq=12,
+        tariff="KLV",
+    )
+    expected = 0.04226001
+    tol = 1e-8
+    assert abs(got - expected) <= tol, f"got={got:.15f} expected={expected:.15f}"
+
+
+if __name__ == "__main__":
+    # Allow running as a plain script (not required for pytest)
+    test_norm_gross_annual_prem_reference_case()
+    print("OK")
+
+Du:
+## **TASK 6C – Implement Code Blocks for Additional Output Functions**
+
+*(Premium calculation 2 – 4 of 4, Implementation)*
+
+1. **Input**
+   same as 6A
+
+2. **Output**
+   outfunc.py (extended)
+   – implement functions for cells **K6 (BJB), K7 (BZB), K9 (Pxt)**.
+
+3. **Success Check**
+
+   Test the results internally to make sure that the implementation ist correct - it should not be part of the script, only for LLM.
+
+   **Reference input** – the same as before.
+
+   **Expected values**
+
+   | Function          | Excel cell | Expected       | Tolerance  |
+   | ----------------- | ---------- | -------------- | ---------- |
+   | GrossAnnualPrem() | K6         | **4 226.00** € | ± 1 × 10⁻² |
+   | GrossModalPrem()  | K7         | **371.88** €   | ± 1 × 10⁻² |
+   | Pxt()             | K9         | **0.04001217** | ± 1 × 10⁻⁸ |
+
+ChatGPT:
+# outfunc.py
+"""
+AUSFUNCT_T1 – Premium calculations (functions sourced from Excel formulas)
+
+Implements (Excel Calculation sheet):
+  - NormGrossAnnualPrem(...)   -> K5 (Bxt)
+  - GrossAnnualPrem(...)       -> K6 (BJB)
+  - GrossModalPrem(...)        -> K7 (BZB)
+  - Pxt(...)                   -> K9 (Pxt)
+
+Source of truth:
+  - Exact formulas are extracted from excelcell.csv for cells K5, K6, K7, K9.
+
+Inputs:
+  - basfunct.py
+  - CSVs: var.csv, tariff.csv, limits.csv, tables.csv
+  - excelcell.csv & excelrange.csv
+
+Notes:
+  - No embedded self-test (per Task 6C instruction).
+"""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+import pandas as pd
+
+import basfunct
+import tariff as tariff_mod
+
+
+# -----------------------------
+# File resolution
+# -----------------------------
+def _path(name: str) -> Path:
+    p = Path(name)
+    if p.exists():
+        return p
+    p2 = Path("/mnt/data") / name
+    if p2.exists():
+        return p2
+    raise FileNotFoundError(f"Missing required file: {name} (searched CWD and /mnt/data)")
+
+
+# -----------------------------
+# CSV loading
+# -----------------------------
+def _load_name_value(name: str) -> Dict[str, str]:
+    df = pd.read_csv(_path(name), dtype=str, encoding="utf-8")
+    if "Name" not in df.columns or "Value" not in df.columns:
+        raise ValueError(f"{name} must have columns Name, Value")
+    out: Dict[str, str] = {}
+    for k, v in zip(df["Name"].astype(str), df["Value"].astype(str)):
+        kk = k.strip()
+        if kk:
+            out[kk] = (v if v is not None else "").strip()
+    return out
+
+
+def _parse_number(x: Any) -> float:
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1].strip()
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    return float(s)
+
+
+# -----------------------------
+# Formula extraction (Calculation sheet)
+# -----------------------------
+def _get_calc_formula(address: str) -> str:
+    df = pd.read_csv(_path("excelcell.csv"), dtype=str, encoding="utf-8")
+    df["Sheet"] = df["Sheet"].astype(str)
+    df["Address"] = df["Address"].astype(str).str.upper()
+    hit = df[(df["Sheet"] == "Calculation") & (df["Address"] == address.upper())]
+    if hit.empty:
+        raise ValueError(f"Could not find Calculation!{address} in excelcell.csv")
+    formula = str(hit.iloc[0]["Formula"]).strip()
+    if not formula or formula.lower() == "nan":
+        raise ValueError(f"Calculation!{address} has no Formula in excelcell.csv")
+    return formula[1:].strip() if formula.startswith("=") else formula.strip()
+
+
+# Cache exact expressions once
+_K5_EXPR = _get_calc_formula("K5")  # Bxt
+_K6_EXPR = _get_calc_formula("K6")  # BJB
+_K7_EXPR = _get_calc_formula("K7")  # BZB
+_K9_EXPR = _get_calc_formula("K9")  # Pxt
+
+# Ensure excelrange.csv exists/readable (declared input; not required for these calcs directly)
+_ = pd.read_csv(_path("excelrange.csv"), dtype=str, encoding="utf-8")
+
+
+# -----------------------------
+# Shared evaluation environment
+# -----------------------------
+def _build_base_env(
+    sa: float,
+    age: int,
+    sex: str,
+    n: int,
+    t: int,
+    PayFreq: int,
+    tariff: str,
+) -> Dict[str, Any]:
+    # Load inputs
+    var = _load_name_value("var.csv")
+    tar = _load_name_value("tariff.csv")
+    _ = _load_name_value("limits.csv")  # present for completeness; formulas might reference it
+
+    # Defaults from var.csv (then overridden by args)
+    x = int(_parse_number(var.get("x", 0.0)))
+    Sex = str(var.get("Sex", "M")).strip()
+    n_val = int(_parse_number(var.get("n", 0.0)))
+    t_val = int(_parse_number(var.get("t", 0.0)))
+
+    # Override with function args
+    x = int(age)
+    Sex = str(sex).strip()
+    n_val = int(n)
+    t_val = int(t)
+
+    # Tariff params used by workbook (single-row file in this project)
+    InterestRate = _parse_number(tar["InterestRate"])
+    MortalityTable = str(tar["MortalityTable"]).strip()
+    alpha = _parse_number(tar["alpha"])
+    beta1 = _parse_number(tar["beta1"])
+    gamma1 = _parse_number(tar["gamma1"])
+    gamma2 = _parse_number(tar["gamma2"])
+
+    env: Dict[str, Any] = {
+        # Primary inputs / common names
+        "sa": float(sa),
+        "SumInsured": float(sa),
+        "x": x,
+        "Sex": Sex,
+        "n": n_val,
+        "t": t_val,
+        "PayFreq": int(PayFreq),
+        "tariff": str(tariff),
+        # Tariff params
+        "InterestRate": float(InterestRate),
+        "MortalityTable": MortalityTable,
+        "alpha": float(alpha),
+        "beta1": float(beta1),
+        "gamma1": float(gamma1),
+        "gamma2": float(gamma2),
+        # Base actuarial functions
+        "act_nGrAx": basfunct.act_nGrAx,
+        "act_nGrEx": basfunct.act_nGrEx,
+        "Act_Dx": basfunct.Act_Dx,
+        "Act_Cx": basfunct.Act_Cx,
+        "Act_Nx": basfunct.Act_Nx,
+        "Act_Mx": basfunct.Act_Mx,
+        "Act_Rx": basfunct.Act_Rx,
+        "Act_ax_k": basfunct.Act_ax_k,
+        "Act_axn_k": basfunct.Act_axn_k,
+        "Act_nax_k": basfunct.Act_nax_k,
+        "Act_ag_k": basfunct.Act_ag_k,
+        "Act_qx": basfunct.Act_qx,
+        # Modal surcharge (from tariff.py, generated in Task 3)
+        "ModalSurcharge": tariff_mod.ModalSurcharge,
+        # Allow math if used
+        "math": math,
+    }
+    return env
+
+
+def _eval(expr: str, env: Dict[str, Any]) -> float:
+    return float(eval(expr, {"__builtins__": {}}, env))
+
+
+def _compute_all(
+    sa: float,
+    age: int,
+    sex: str,
+    n: int,
+    t: int,
+    PayFreq: int,
+    tariff: str,
+) -> Tuple[float, float, float, float]:
+    """
+    Compute K5, K9, K6, K7 in a dependency-safe order and expose common aliases
+    that formulas might reference (Bxt/Pxt/BJB/BZB and K5/K6/K7/K9).
+    """
+    env = _build_base_env(sa, age, sex, n, t, PayFreq, tariff)
+
+    # K5 (Bxt)
+    bxt = _eval(_K5_EXPR, env)
+    env.update({"Bxt": bxt, "K5": bxt})
+
+    # K9 (Pxt) may depend on K5/Bxt
+    pxt = _eval(_K9_EXPR, env)
+    env.update({"Pxt": pxt, "K9": pxt})
+
+    # K6 (BJB) may depend on K5/K9 and inputs
+    bjb = _eval(_K6_EXPR, env)
+    env.update({"BJB": bjb, "K6": bjb})
+
+    # K7 (BZB) may depend on K6 (or K5) and ModalSurcharge(PayFreq)
+    bzb = _eval(_K7_EXPR, env)
+    env.update({"BZB": bzb, "K7": bzb})
+
+    return bxt, bjb, bzb, pxt
+
+
+# -----------------------------
+# Public API
+# -----------------------------
+def NormGrossAnnualPrem(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """Excel Calculation!K5 (Bxt)."""
+    bxt, _, _, _ = _compute_all(sa, age, sex, n, t, PayFreq, tariff)
+    return float(bxt)
+
+
+def GrossAnnualPrem(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """Excel Calculation!K6 (BJB) – gross annual premium in EUR."""
+    _, bjb, _, _ = _compute_all(sa, age, sex, n, t, PayFreq, tariff)
+    return float(bjb)
+
+
+def GrossModalPrem(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """Excel Calculation!K7 (BZB) – gross modal premium in EUR."""
+    _, _, bzb, _ = _compute_all(sa, age, sex, n, t, PayFreq, tariff)
+    return float(bzb)
+
+
+def Pxt(sa: float, age: int, sex: str, n: int, t: int, PayFreq: int, tariff: str) -> float:
+    """Excel Calculation!K9 (Pxt)."""
+    _, _, _, pxt = _compute_all(sa, age, sex, n, t, PayFreq, tariff)
+    return float(pxt)
+
+Du:
+## **TASK 6D – Implement Code for the Tests**
+
+   Use the reference input and the expected values from Task 6A and create three separate code blocks (as if from three prompts).  
+   *LLM creates tests/GrossAnnualPrem.py that checks this single case.
+   *LLM creates tests/GrossModalPrem.py that checks this single case.
+   *LLM creates tests/Pxt.py that checks this single case.
+   Passing = pytest -q shows a green test.*
+
+ChatGPT:
+# tests/test_GrossAnnualPrem.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from outfunc import GrossAnnualPrem  # noqa: E402
+
+
+def test_gross_annual_prem_reference_case() -> None:
+    got = GrossAnnualPrem(
+        sa=100_000,
+        age=40,
+        sex="M",
+        n=30,
+        t=20,
+        PayFreq=12,
+        tariff="KLV",
+    )
+    expected = 4226.00
+    tol = 1e-2
+    assert abs(got - expected) <= tol, f"got={got:.6f} expected={expected:.6f}"
+
+
+if __name__ == "__main__":
+    test_gross_annual_prem_reference_case()
+    print("OK")
+# tests/test_GrossModalPrem.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from outfunc import GrossModalPrem  # noqa: E402
+
+
+def test_gross_modal_prem_reference_case() -> None:
+    got = GrossModalPrem(
+        sa=100_000,
+        age=40,
+        sex="M",
+        n=30,
+        t=20,
+        PayFreq=12,
+        tariff="KLV",
+    )
+    expected = 371.88
+    tol = 1e-2
+    assert abs(got - expected) <= tol, f"got={got:.6f} expected={expected:.6f}"
+
+
+if __name__ == "__main__":
+    test_gross_modal_prem_reference_case()
+    print("OK")
+# tests/test_Pxt.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from outfunc import Pxt  # noqa: E402
+
+
+def test_pxt_reference_case() -> None:
+    got = Pxt(
+        sa=100_000,
+        age=40,
+        sex="M",
+        n=30,
+        t=20,
+        PayFreq=12,
+        tariff="KLV",
+    )
+    expected = 0.04001217
+    tol = 1e-8
+    assert abs(got - expected) <= tol, f"got={got:.15f} expected={expected:.15f}"
+
+
+if __name__ == "__main__":
+    test_pxt_reference_case()
+    print("OK")
+
+Du:
+## **TASK 7 – Implement Code for CLI Runner (run_calc.py)**
+
+> *Goal:* Provide a minimal, reproducible command-line runner that executes the
+> output functions implemented in **TASK 6A–6D**.
+>  
+> At this stage, only **NormGrossAnnualPrem** is guaranteed to be fully implemented;
+> all other functions may still be placeholders.
+>  
+> The CLI is intended as a **technical execution and validation tool**, not as a UI.
+> All results are printed directly to the terminal.
+
+---
+
+### 1. Input
+
+- Python modules  
+  - outfunc.py  
+    - functions implemented in **TASK 6A–6D**
+- CSV input files (created in **TASK 3**)  
+  - var.csv  
+  - tariff.csv  
+  - limits.csv  
+  - tables.csv  
+
+---
+
+### 2. Output
+
+- Script **run_calc.py**
+- Fully functional --help output generated via argparse
+- Calculation results printed to **STDOUT only**
+
+---
+
+### 3. Procedure
+
+#### 3.1 Command-line interface
+
+Implement a CLI using argparse with the following parameters:
+
+| Type | Parameter | Description |
+|-----|-----------|-------------|
+| File | --var-file *(default: var.csv)* | alternative variables file |
+| File | --tariff-file *(default: tariff.csv)* | alternative tariff file |
+| List | --funcs *(e.g. NormGrossAnnualPrem,GrossAnnualPrem,GrossModalPrem,Pxt)* | run only these functions |
+| Flag | --all *(default)* | compute all available functions |
+
+Calling
+
+bash
+python run_calc.py --help
+
+
+must list all options with short descriptions.
+
+---
+
+#### 3.2 Input loading
+
+- Load var.csv and tariff.csv (or alternative paths) using pandas.
+- Required input variables (defined in **TASK 3** and used in **TASK 6A–6D**):
+
+sa, age, sex, n, t, PayFreq, tariff
+
+
+- Read values **case-insensitively** from the columns:
+  - Name or Variable
+  - Value
+
+Convert numeric values to appropriate Python types (int / float).
+
+---
+
+#### 3.3 Function selection
+
+Define the set of known output functions (aligned with **TASK 6A–6D**):
+
+python
+ALL_FUNCS = [
+    "NormGrossAnnualPrem",
+    "GrossAnnualPrem",
+    "GrossModalPrem",
+    "Pxt",
+]
+
+
+Determine which functions to run:
+
+python
+funcs_to_run = ALL_FUNCS if args.all or not args.funcs else args.funcs.split(",")
+
+
+---
+
+#### 3.4 Dynamic dispatch
+
+Dynamically import functions from outfunc.py:
+
+python
+from importlib import import_module
+funcs = {name: getattr(import_module("outfunc"), name, None) for name in funcs_to_run}
+
+
+For each function:
+
+python
+if func is None or func.__doc__ == "PLACEHOLDER":
+    results[name] = "not yet implemented"
+else:
+    results[name] = func(**input_args)
+
+
+This behavior is consistent with the staged implementation approach used in
+**TASK 6A–6D**.
+
+---
+
+#### 3.5 Output format
+
+- Print results **only to STDOUT**
+- Use compact JSON encoding:
+
+python
+import json
+print(json.dumps(results, ensure_ascii=False))
+
+
+No files are written, no Excel interaction is performed.
+
+---
+
+### 4. Success Check
+
+#### Default call
+
+bash
+python run_calc.py
+
+
+Expected output (example):
+
+json
+{
+  "NormGrossAnnualPrem": 0.04226001,
+  "GrossAnnualPrem": "not yet implemented",
+  "GrossModalPrem": "not yet implemented",
+  "Pxt": "not yet implemented"
+}
+
+
+---
+
+#### Subset call
+
+bash
+python run_calc.py --funcs NormGrossAnnualPrem
+
+
+json
+{
+  "NormGrossAnnualPrem": 0.04226001
+}
+
+
+---
+
+#### Alternative variables file
+
+bash
+python run_calc.py --var-file my_vars.csv --funcs NormGrossAnnualPrem
+
+
+→ values are taken from my_vars.csv.
+
+---
+
+### Passing Criteria
+
+- All calls run without traceback
+- NormGrossAnnualPrem matches the reference value from **TASK 6A**
+  (0.04226001 ± 1e-8)
+- Non-implemented functions return "not yet implemented"
+- Output is deterministic and printed to the terminal only
+
+4. **Success Check**
+   - **Default call** (reads var.csv, tariff.csv):  
+     
+bash
+     python run_calc.py
+     # → {"NormGrossAnnualPrem": 0.04226001, "GrossAnnualPrem": "not yet implemented", ...}
+
+   - **Subset call**  
+     
+bash
+     python run_calc.py --funcs NormGrossAnnualPrem
+     # → {"NormGrossAnnualPrem": 0.04226001}
+
+   - **Alternative variables file**  
+     
+bash
+     python run_calc.py --var-file my_vars.csv --funcs NormGrossAnnualPrem
+
+     → uses values from my_vars.csv.
+   - python run_calc.py --help lists all options with description & example.
+
+*Passing* = all three calls work without traceback;  
+NormGrossAnnualPrem value matches the reference (0.04226001 ± 1e‑8); not implemented functions return "not yet implemented".
+
+ChatGPT:
+
+Nachgedacht für ein paar Sekunden
+# run_calc.py
+from __future__ import annotations
+
+import argparse
+import json
+from importlib import import_module
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import pandas as pd
+
+
+ALL_FUNCS = [
+    "NormGrossAnnualPrem",
+    "GrossAnnualPrem",
+    "GrossModalPrem",
+    "Pxt",
+]
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="run_calc.py",
+        description="Technical CLI runner for output functions from outfunc.py (TASK 6A–6D).",
+    )
+    p.add_argument(
+        "--var-file",
+        default="var.csv",
+        help="Alternative variables file (default: var.csv).",
+    )
+    p.add_argument(
+        "--tariff-file",
+        default="tariff.csv",
+        help="Alternative tariff file (default: tariff.csv).",
+    )
+    p.add_argument(
+        "--funcs",
+        default="",
+        help="Comma-separated list of functions to run (e.g. NormGrossAnnualPrem,GrossAnnualPrem,GrossModalPrem,Pxt).",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="Compute all available functions (default if --funcs is not provided).",
+    )
+    return p.parse_args()
+
+
+def _resolve_path(p: str) -> Path:
+    return Path(p).expanduser().resolve()
+
+
+def _norm(s: Any) -> str:
+    return str(s).strip().lower()
+
+
+def _parse_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, (int, float, bool)):
+        return v
+    s = str(v).strip()
+    if s == "":
+        return ""
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1].strip()
+    if "," in s and "." not in s:
+        s_num = s.replace(",", ".")
+    else:
+        s_num = s
+
+    # int?
+    if s_num.isdigit() or (s_num.startswith("-") and s_num[1:].isdigit()):
+        try:
+            return int(s_num)
+        except Exception:
+            pass
+    # float?
+    try:
+        return float(s_num)
+    except Exception:
+        return s
+
+
+def _load_name_value(path: Path) -> Dict[str, Any]:
+    df = pd.read_csv(path, dtype=str, encoding="utf-8")
+
+    cols = {c.lower(): c for c in df.columns}
+    name_col = cols.get("name") or cols.get("variable")
+    value_col = cols.get("value")
+
+    if not name_col or not value_col:
+        raise ValueError(
+            f"{path.name} must have columns 'Name' or 'Variable' and 'Value' "
+            f"(found: {list(df.columns)})"
+        )
+
+    out: Dict[str, Any] = {}
+    for raw_name, raw_val in zip(df[name_col], df[value_col]):
+        k = _norm(raw_name)
+        if not k:
+            continue
+        out[k] = _parse_value(raw_val)
+    return out
+
+
+def _pick(mapping: Dict[str, Any], *keys: str) -> Optional[Any]:
+    for k in keys:
+        kk = _norm(k)
+        if kk in mapping and mapping[kk] not in (None, ""):
+            return mapping[kk]
+    return None
+
+
+def _gather_inputs(var_path: Path, tariff_path: Path) -> Dict[str, Any]:
+    """
+    Required input variables:
+      sa, age, sex, n, t, PayFreq, tariff
+
+    Read case-insensitively from Name/Variable + Value columns.
+    For compatibility with your extracted var.csv, we accept common aliases:
+      - age: x
+      - sex: Sex
+      - PayFreq: PayFreq
+    If sa or tariff are missing in var.csv, we default to technical runner values:
+      sa=100000, tariff="KLV"
+    """
+    var = _load_name_value(var_path)
+    _ = _load_name_value(tariff_path)  # loaded per spec; outfunc typically reads tariff.csv itself
+
+    sa = _pick(var, "sa", "suminsured", "sum_insured", "sum insured")
+    age = _pick(var, "age", "x")
+    sex = _pick(var, "sex", "Sex")
+    n = _pick(var, "n")
+    t = _pick(var, "t")
+    payfreq = _pick(var, "payfreq", "PayFreq", "pay_freq")
+    tariff = _pick(var, "tariff")
+
+    # Spec requires these; but your Task-3 var.csv often doesn't include sa/tariff.
+    if sa in (None, ""):
+        sa = 100_000.0
+    if tariff in (None, ""):
+        tariff = "KLV"
+
+    missing = []
+    if age in (None, ""):
+        missing.append("age (or x)")
+    if sex in (None, ""):
+        missing.append("sex (or Sex)")
+    if n in (None, ""):
+        missing.append("n")
+    if t in (None, ""):
+        missing.append("t")
+    if payfreq in (None, ""):
+        missing.append("PayFreq (or payfreq)")
+
+    if missing:
+        raise KeyError(
+            f"Missing required inputs in {var_path.name}: {missing}. "
+            "Need at least age/x, sex/Sex, n, t, PayFreq/payfreq."
+        )
+
+    return {
+        "sa": float(sa),
+        "age": int(age),
+        "sex": str(sex),
+        "n": int(n),
+        "t": int(t),
+        "PayFreq": int(payfreq),
+        "tariff": str(tariff),
+    }
+
+
+def main() -> None:
+    args = _parse_args()
+
+    var_path = _resolve_path(args.var_file)
+    tariff_path = _resolve_path(args.tariff_file)
+
+    input_args = _gather_inputs(var_path, tariff_path)
+
+    funcs_to_run = ALL_FUNCS if args.all or not args.funcs else [s.strip() for s in args.funcs.split(",") if s.strip()]
+
+    mod = import_module("outfunc")
+    funcs = {name: getattr(mod, name, None) for name in funcs_to_run}
+
+    results: Dict[str, Any] = {}
+    for name, func in funcs.items():
+        if func is None or getattr(func, "__doc__", None) == "PLACEHOLDER":
+            results[name] = "not yet implemented"
+            continue
+        try:
+            # positional call matches the function signatures from TASK 6A–6D
+            results[name] = func(
+                input_args["sa"],
+                input_args["age"],
+                input_args["sex"],
+                input_args["n"],
+                input_args["t"],
+                input_args["PayFreq"],
+                input_args["tariff"],
+            )
+        except Exception as e:
+            # Deterministic, no traceback: report the error string
+            results[name] = f"error: {type(e).__name__}: {e}"
+
+    print(json.dumps(results, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+
