@@ -149,7 +149,7 @@ Passing = `pytest -q` runs completely green.
    • Function `NormGrossAnnualPrem(sa, age, sex, n, t, PayFreq, tariff)` in `outfunc.py`
 
 5. **Procedure**
-   • Formula exactly as in Calculation!K5 (“Bxt”).
+   • Formula exactly as in Calculation!K5 ("NormGrossAnnualPrem").
    • Dependencies: - Variables → `var.csv` - Tariff/Limits → `tariff.csv`, `limits.csv` - Base functions → `basfunct.py`.
    • Do not leave placeholders (`pass`).
 
