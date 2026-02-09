@@ -1,356 +1,206 @@
 #!/usr/bin/env python3
 """
-excel_to_text.py
+EXCEL_TO_TEXT: Export Excel workbook content to CSV.
 
-Export non-empty Excel cells (formula + value) and named ranges to CSV.
+Input:
+  input/Tariff_Calculator.xlsm
 
-Default layout for your repo:
-- Project root contains folder: /Bartek
-- Excel file is located in: /Bartek/input/Tariff_Calculator.xlsm
-- This script is located in: /Bartek/output/excel_to_text.py
-- Outputs are written to: /Bartek/output (same directory as this script):
+Outputs (written to project root / current working directory):
   - excelcell.csv  columns: Sheet, Address, Formula, Value
   - excelrange.csv columns: Sheet, Name, Address
 
-Requirements:
-- xlwings (needs local Excel)
+Notes:
+  - Uses xlwings (requires local Excel installation).
+  - Ignores empty cells (both formula and value empty/None).
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
-import sys
-from dataclasses import dataclass
+import json
+import re
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
 import xlwings as xw
-from openpyxl.utils import get_column_letter
 
 
-@dataclass(frozen=True)
-class CellRow:
-    sheet: str
-    address: str
-    formula: str
-    value: str
+INPUT_PATH = Path("input") / "Tariff_Calculator.xlsm"
+OUT_CELLS = Path("excelcell.csv")
+OUT_RANGES = Path("excelrange.csv")
 
 
-@dataclass(frozen=True)
-class RangeRow:
-    sheet: str
-    name: str
-    address: str
+def col_to_letters(col_num: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> AA"""
+    if col_num < 1:
+        raise ValueError(f"Invalid column number: {col_num}")
+    letters = []
+    while col_num:
+        col_num, rem = divmod(col_num - 1, 26)
+        letters.append(chr(65 + rem))
+    return "".join(reversed(letters))
 
 
-def _stringify_value(v: Any) -> str:
+def a1_address(row: int, col: int) -> str:
+    return f"{col_to_letters(col)}{row}"
+
+
+def stringify_value(v: Any) -> str:
     if v is None:
         return ""
-    if isinstance(v, (list, tuple)):
+    # Excel errors sometimes come through as strings like '#N/A', keep as-is
+    if isinstance(v, (str, int, float, bool)):
         return str(v)
-    return str(v)
-
-
-def _norm_2d(m: Any) -> list[list[Any]]:
-    if m is None:
-        return []
-    if isinstance(m, (list, tuple)):
-        if not m:
-            return []
-        if not isinstance(m[0], (list, tuple)):
-            return [list(m)]
-        return [list(r) for r in m]
-    return [[m]]
-
-
-def _a1_address(row: int, col: int) -> str:
-    return f"{get_column_letter(col)}{row}"
-
-
-def _is_empty_cell(formula: Any, value: Any) -> bool:
-    f = "" if formula is None else str(formula)
-    v = "" if value is None else str(value)
-    return (f.strip() == "") and (v.strip() == "")
-
-
-def _safe_has_array(cell_api: Any) -> bool:
+    # Datetimes, arrays, etc.
     try:
-        return bool(cell_api.HasArray)
-    except Exception:
-        return False
+        return json.dumps(v, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(v)
 
 
-def _safe_formula_array(cell_api: Any) -> Optional[str]:
+def normalize_formula(f: Any) -> str:
+    if f is None:
+        return ""
+    if isinstance(f, str):
+        return f
+    # xlwings can return nested lists for multi-area; serialize to JSON for safety
     try:
-        fa = cell_api.FormulaArray
-        if fa is None:
-            return None
-        return str(fa)
-    except Exception:
-        return None
+        return json.dumps(f, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(f)
 
 
-def _safe_formula(cell_api: Any) -> Optional[str]:
-    for attr in ("Formula2", "Formula"):
-        try:
-            val = getattr(cell_api, attr)
-            if val is None:
-                continue
-            return str(val)
-        except Exception:
-            continue
-    return None
+_REFERS_TO_SHEET_RE = re.compile(
+    r"""^=?'?(?P<sheet>[^']+?)'?!""", re.IGNORECASE
+)
 
 
-def export_cells(book: xw.Book) -> list[CellRow]:
-    rows: list[CellRow] = []
-
-    for sh in book.sheets:
-        sheet_name = sh.name
-        try:
-            used = sh.api.UsedRange
-            start_row = int(used.Row)
-            start_col = int(used.Column)
-            n_rows = int(used.Rows.Count)
-            n_cols = int(used.Columns.Count)
-        except Exception:
-            continue
-
-        if n_rows <= 0 or n_cols <= 0:
-            continue
-
-        # Bulk read
-        try:
-            rng = sh.range(
-                (start_row, start_col),
-                (start_row + n_rows - 1, start_col + n_cols - 1),
-            )
-            values_2d = _norm_2d(rng.value)
-            formulas_2d = _norm_2d(rng.formula)
-        except Exception:
-            values_2d = []
-            formulas_2d = []
-
-        if not values_2d or not formulas_2d:
-            # Per-cell fallback
-            for r in range(start_row, start_row + n_rows):
-                for c in range(start_col, start_col + n_cols):
-                    try:
-                        cell = sh.range((r, c))
-                        val = cell.value
-                        f = _safe_formula(cell.api) or ""
-                        if _is_empty_cell(f, val):
-                            continue
-                        if _safe_has_array(cell.api):
-                            fa = _safe_formula_array(cell.api)
-                            if fa:
-                                f = fa
-                        rows.append(CellRow(sheet_name, _a1_address(r, c), f, _stringify_value(val)))
-                    except Exception:
-                        continue
-            continue
-
-        # Bulk iteration + targeted COM fixes
-        for r_off, (val_row, f_row) in enumerate(zip(values_2d, formulas_2d)):
-            r = start_row + r_off
-            max_len = max(len(val_row), len(f_row))
-            for c_off in range(max_len):
-                c = start_col + c_off
-                val = val_row[c_off] if c_off < len(val_row) else None
-                f = f_row[c_off] if c_off < len(f_row) else None
-
-                if _is_empty_cell(f, val):
-                    continue
-
-                formula_str = "" if f is None else str(f)
-
-                try:
-                    cell_api = sh.range((r, c)).api
-                    if _safe_has_array(cell_api):
-                        fa = _safe_formula_array(cell_api)
-                        if fa:
-                            formula_str = fa
-                    elif formula_str.strip() == "":
-                        com_f = _safe_formula(cell_api)
-                        if com_f:
-                            formula_str = com_f
-                except Exception:
-                    pass
-
-                rows.append(CellRow(sheet_name, _a1_address(r, c), formula_str, _stringify_value(val)))
-
-    return rows
-
-
-def _parse_refers_to(refers_to: str) -> Tuple[str, str]:
-    s = (refers_to or "").strip()
+def parse_sheet_from_refers_to(refers_to: str) -> str:
+    """
+    Try to extract the sheet name from a Name.RefersTo string like:
+      ="'Calculation'!$A$1:$B$2"
+      ="=Calculation!$A$1"
+    """
+    if not refers_to:
+        return ""
+    s = refers_to.strip()
     if s.startswith("="):
-        s = s[1:].strip()
-    if "!" not in s:
-        return ("", refers_to or "")
-    left, right = s.split("!", 1)
-    left = left.strip()
-    right = right.strip()
-    if left.startswith("'") and left.endswith("'") and len(left) >= 2:
-        left = left[1:-1]
-    return (left, right)
+        s = s[1:].lstrip()
+    m = _REFERS_TO_SHEET_RE.match(s)
+    return m.group("sheet") if m else ""
 
 
-def export_named_ranges(book: xw.Book) -> list[RangeRow]:
-    out: list[RangeRow] = []
+def is_empty_cell(formula: str, value: Any) -> bool:
+    # Treat as empty if no formula and value is None/"".
+    if formula and formula != "":
+        return False
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
 
-    try:
-        wb_names = list(book.names)
-    except Exception:
-        wb_names = []
 
-    for nm in wb_names:
-        try:
-            name_str = nm.name
-        except Exception:
-            name_str = ""
-        try:
-            refers_to = nm.refers_to
-        except Exception:
-            refers_to = ""
+def iter_used_range_cells(
+    sheet: xw.Sheet,
+) -> Iterable[Tuple[str, str, str, Any]]:
+    """
+    Yield (sheet_name, address, formula, value) for non-empty cells in sheet.used_range.
+    Uses array reads for performance and to preserve array formulas via Excel.
+    """
+    used = sheet.used_range
+    # If the sheet is truly empty, used_range may still return A1; we will filter empties.
+    top_row = used.row
+    left_col = used.column
+    nrows = used.rows.count
+    ncols = used.columns.count
 
-        sheet_name = ""
-        address = ""
-        try:
-            r = nm.refers_to_range
-            sheet_name = r.sheet.name
-            address = r.api.Address
-        except Exception:
-            sheet_name, address = _parse_refers_to(refers_to)
+    # Read formulas & values as 2D arrays in a single call each
+    formulas = used.formula  # can be scalar if single cell
+    values = used.value
 
-        if not (name_str.strip() or address.strip() or sheet_name.strip()):
-            continue
-        out.append(RangeRow(sheet_name, name_str, address))
+    # Normalize to 2D lists
+    if nrows == 1 and ncols == 1:
+        formulas_2d = [[formulas]]
+        values_2d = [[values]]
+    else:
+        # xlwings returns list-of-lists for ranges; ensure shape
+        formulas_2d = formulas
+        values_2d = values
 
-    for sh in book.sheets:
-        try:
-            sh_names = list(sh.names)
-        except Exception:
-            sh_names = []
-        for nm in sh_names:
-            try:
-                name_str = nm.name
-            except Exception:
-                name_str = ""
-            try:
-                refers_to = nm.refers_to
-            except Exception:
-                refers_to = ""
-
-            sheet_name = sh.name
-            address = ""
-            try:
-                r = nm.refers_to_range
-                address = r.api.Address
-            except Exception:
-                _, address = _parse_refers_to(refers_to)
-
-            if not (name_str.strip() or address.strip()):
+    for r in range(nrows):
+        row_idx = top_row + r
+        for c in range(ncols):
+            col_idx = left_col + c
+            f = normalize_formula(formulas_2d[r][c])
+            v = values_2d[r][c]
+            if is_empty_cell(f, v):
                 continue
-            out.append(RangeRow(sheet_name, name_str, address))
-
-    seen: set[Tuple[str, str, str]] = set()
-    deduped: list[RangeRow] = []
-    for rr in out:
-        key = (rr.sheet, rr.name, rr.address)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(rr)
-    return deduped
+            addr = a1_address(row_idx, col_idx)
+            yield (sheet.name, addr, f, v)
 
 
-def write_csv(path: Path, headers: Iterable[str], rows: Iterable[Iterable[Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
+def export_cells(book: xw.Book) -> int:
+    count = 0
+    with OUT_CELLS.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(list(headers))
-        for r in rows:
-            w.writerow(list(r))
+        w.writerow(["Sheet", "Address", "Formula", "Value"])
+        for sht in book.sheets:
+            for sheet_name, addr, formula, value in iter_used_range_cells(sht):
+                w.writerow([sheet_name, addr, formula, stringify_value(value)])
+                count += 1
+    return count
 
 
-def _default_excel_path(script_path: Path) -> Path:
-    """
-    If script is /Bartek/output/excel_to_text.py -> default Excel: /Bartek/input/Tariff_Calculator.xlsm
-    Otherwise, fall back to ./input/Tariff_Calculator.xlsm relative to CWD.
-    """
-    # Prefer repo layout relative to the script itself (robust when run from elsewhere).
-    bartek_dir = script_path.parent.parent
-    candidate = bartek_dir / "input" / "Tariff_Calculator.xlsm"
-    if candidate.exists():
-        return candidate.resolve()
+def export_named_ranges(book: xw.Book) -> int:
+    count = 0
+    with OUT_RANGES.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Sheet", "Name", "Address"])
+        for nm in book.names:
+            try:
+                name = nm.name
+                refers_to = nm.refers_to  # e.g., ="'Sheet'!$A$1:$B$2"
+            except Exception:
+                # Skip names we cannot read (rare)
+                continue
+            sheet = parse_sheet_from_refers_to(refers_to)
+            if not name or not refers_to:
+                continue
+            w.writerow([sheet, name, refers_to])
+            count += 1
+    return count
 
-    cwd_candidate = Path.cwd() / "input" / "Tariff_Calculator.xlsm"
-    return cwd_candidate.resolve()
 
+def main() -> None:
+    if not INPUT_PATH.exists():
+        raise FileNotFoundError(f"Excel input not found: {INPUT_PATH.resolve()}")
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Export Excel cell context and named ranges to CSV.")
-    parser.add_argument(
-        "--excel",
-        type=str,
-        default="",
-        help="Path to the Excel workbook (.xlsm). If omitted, defaults to /Bartek/input/Tariff_Calculator.xlsm based on script location.",
-    )
-    args = parser.parse_args()
-
-    script_path = Path(__file__).resolve()
-    excel_path = Path(args.excel).resolve() if args.excel else _default_excel_path(script_path)
-
-    if not excel_path.exists():
-        print(f"ERROR: Excel file not found: {excel_path}", file=sys.stderr)
-        print("Tip: pass --excel <path-to-Tariff_Calculator.xlsm>", file=sys.stderr)
-        return 2
-
-    out_dir = script_path.parent  # /Bartek/output (all generated artifacts go here)
-    cell_csv = out_dir / "excelcell.csv"
-    range_csv = out_dir / "excelrange.csv"
-
-    app = xw.App(visible=False, add_book=False)
-    try:
-        app.display_alerts = False
-        app.screen_updating = False
-    except Exception:
-        pass
-
+    app: Optional[xw.App] = None
     book: Optional[xw.Book] = None
     try:
-        book = app.books.open(str(excel_path), update_links=False, read_only=True)
+        app = xw.App(visible=False, add_book=False)
+        app.display_alerts = False
+        app.screen_updating = False
+
+        book = app.books.open(str(INPUT_PATH), update_links=False, read_only=True)
 
         cell_rows = export_cells(book)
         range_rows = export_named_ranges(book)
 
-        write_csv(
-            cell_csv,
-            headers=("Sheet", "Address", "Formula", "Value"),
-            rows=((r.sheet, r.address, r.formula, r.value) for r in cell_rows),
-        )
-        write_csv(
-            range_csv,
-            headers=("Sheet", "Name", "Address"),
-            rows=((r.sheet, r.name, r.address) for r in range_rows),
-        )
+        # Basic sanity output for humans
+        print(f"Wrote {OUT_CELLS} with {cell_rows} data rows.")
+        print(f"Wrote {OUT_RANGES} with {range_rows} data rows.")
+        print(f"Workbook: {INPUT_PATH}")
 
-        print(f"Wrote: {cell_csv} ({len(cell_rows)} rows)")
-        print(f"Wrote: {range_csv} ({len(range_rows)} rows)")
-        return 0
     finally:
         try:
             if book is not None:
                 book.close()
-        except Exception:
-            pass
-        try:
-            app.quit()
-        except Exception:
-            pass
+        finally:
+            if app is not None:
+                app.quit()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

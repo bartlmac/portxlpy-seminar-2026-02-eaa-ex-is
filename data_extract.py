@@ -1,313 +1,341 @@
 #!/usr/bin/env python3
 """
-data_extract.py
+DATA_EXTRACT: Create normalized input datasets from excel exports.
 
-TASK 3 – Extract data blocks from exported Excel context CSVs.
+Inputs (expected in project root):
+  - excelcell.csv   columns: Sheet, Address, Formula, Value
+  - excelrange.csv  columns: Sheet, Name, Address   (not required for the specific outputs, but validated)
 
-Update (per your clarification):
-- tables.csv – MortalityTable from sheet "MortalityTables", columns A–E
-  - headers are in row 3  (MortalityTables!A3:E3)
-  - data starts in row 4  (MortalityTables!A4:E...)
+If not found in CWD, the script also checks:
+  - /mnt/data/excelcell.csv
+  - /mnt/data/excelrange.csv
 
-Other outputs (unchanged):
-- var.csv    – Calculation!A4:B9   (Name, Value)
-- tariff.csv – Calculation!D4:E11  (Name, Value)
-- limits.csv – Calculation!G4:H5   (Name, Value)
-- tariff.py  – ModalSurcharge(PayFreq) from Calculation!E12
+Outputs (written to project root / current working directory):
+  - var.csv     (Name, Value) from Calculation!A4:B9
+  - tariff.csv  (Name, Value) from Calculation!D4:E11
+  - limits.csv  (Name, Value) from Calculation!G4:H5
+  - tables.csv  (Name, Value) from MortalityTables!A:E (headers row 3, data from row 4)
+  - tariff.py   implements ModalSurcharge(PayFreq) exactly per Calculation!E12
 
-Inputs:
-- excelcell.csv
-- excelrange.csv (loaded for completeness)
-
-Outputs go to --outdir (default: directory of this script, e.g. /Bartek/output)
+Success intent:
+  - All files exist & have >= 1 data row (tables >= 100 expected for this workbook)
+  - import tariff; tariff.ModalSurcharge(12) matches the Excel E12 logic.
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
+import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-import pandas as pd
+# ----------------------------
+# Paths
+# ----------------------------
+CANDIDATE_EXCELCELL = [Path("excelcell.csv"), Path("/mnt/data/excelcell.csv")]
+CANDIDATE_EXCELRANGE = [Path("excelrange.csv"), Path("/mnt/data/excelrange.csv")]
 
-ADDR_RE = re.compile(r"^([A-Z]+)(\d+)$")
+OUT_VAR = Path("var.csv")
+OUT_TARIFF = Path("tariff.csv")
+OUT_LIMITS = Path("limits.csv")
+OUT_TABLES = Path("tables.csv")
+OUT_TARIFF_PY = Path("tariff.py")
 
-
-def _script_dir() -> Path:
-    return Path(__file__).resolve().parent
-
-
-def _default_in_path(filename: str) -> Path:
-    local = _script_dir() / filename
-    if local.exists():
-        return local
-    return (Path("/mnt/data") / filename).resolve()
-
-
-def _parse_a1(addr: str) -> Tuple[str, int]:
-    m = ADDR_RE.match(addr.strip().upper())
-    if not m:
-        raise ValueError(f"Invalid A1 address: {addr!r}")
-    return m.group(1), int(m.group(2))
+A1_RE = re.compile(r"^\$?([A-Z]+)\$?(\d+)$", re.IGNORECASE)
 
 
-def _col_to_num(col: str) -> int:
+def pick_existing(candidates: List[Path]) -> Path:
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"None of these input files exist: {', '.join(map(str, candidates))}")
+
+
+# ----------------------------
+# A1 helpers
+# ----------------------------
+def col_letters_to_num(letters: str) -> int:
+    letters = letters.strip().upper()
     n = 0
-    for ch in col:
+    for ch in letters:
+        if not ("A" <= ch <= "Z"):
+            raise ValueError(f"Invalid column letters: {letters}")
         n = n * 26 + (ord(ch) - ord("A") + 1)
     return n
 
 
-def _num_to_col(n: int) -> str:
+def col_num_to_letters(n: int) -> str:
+    if n < 1:
+        raise ValueError(f"Invalid column number: {n}")
     out = []
-    while n > 0:
+    while n:
         n, rem = divmod(n - 1, 26)
-        out.append(chr(rem + ord("A")))
+        out.append(chr(ord("A") + rem))
     return "".join(reversed(out))
 
 
-def _a1(col: str, row: int) -> str:
-    return f"{col}{row}"
+def a1(row: int, col: int) -> str:
+    return f"{col_num_to_letters(col)}{row}"
 
 
-def _write_csv_rows(path: Path, header: Iterable[str], rows: Iterable[Iterable[object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
+# ----------------------------
+# Load excelcell.csv into mapping
+# ----------------------------
+def load_excelcell(path: Path) -> Dict[Tuple[str, str], Dict[str, str]]:
+    """
+    Mapping:
+      (sheet, address_upper) -> {"value": str, "formula": str}
+    """
+    out: Dict[Tuple[str, str], Dict[str, str]] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        r = csv.DictReader(f)
+        required = {"Sheet", "Address", "Formula", "Value"}
+        if not r.fieldnames or not required.issubset(set(r.fieldnames)):
+            raise ValueError(f"{path} must have columns {sorted(required)}; got {r.fieldnames}")
+
+        for row in r:
+            sheet = (row.get("Sheet") or "").strip()
+            addr = (row.get("Address") or "").strip().upper()
+            if not sheet or not addr:
+                continue
+            out[(sheet, addr)] = {
+                "value": row.get("Value") or "",
+                "formula": row.get("Formula") or "",
+            }
+    return out
+
+
+def validate_excelrange(path: Path) -> None:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        r = csv.DictReader(f)
+        required = {"Sheet", "Name", "Address"}
+        if not r.fieldnames or not required.issubset(set(r.fieldnames)):
+            raise ValueError(f"{path} must have columns {sorted(required)}; got {r.fieldnames}")
+
+
+def get_value(cells: Dict[Tuple[str, str], Dict[str, str]], sheet: str, addr: str) -> str:
+    rec = cells.get((sheet, addr.upper()))
+    return "" if rec is None else (rec.get("value") or "")
+
+
+def get_formula(cells: Dict[Tuple[str, str], Dict[str, str]], sheet: str, addr: str) -> str:
+    rec = cells.get((sheet, addr.upper()))
+    return "" if rec is None else (rec.get("formula") or "")
+
+
+# ----------------------------
+# Block extraction helpers
+# ----------------------------
+def write_name_value(path: Path, rows: List[Tuple[str, str]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(list(header))
-        for r in rows:
-            w.writerow(list(r))
+        w.writerow(["Name", "Value"])
+        for name, value in rows:
+            name_s = (name or "").strip()
+            value_s = (value or "").strip()
+            if name_s == "" and value_s == "":
+                continue
+            w.writerow([name_s, value_s])
 
 
-def _build_cell_map(excelcell: pd.DataFrame) -> Dict[Tuple[str, str], str]:
-    m: Dict[Tuple[str, str], str] = {}
-    for _, r in excelcell.iterrows():
-        sheet = str(r.get("Sheet", "")).strip()
-        addr = str(r.get("Address", "")).strip().upper()
-        val = r.get("Value", "")
-        val_str = "" if pd.isna(val) else str(val)
-        if sheet and addr:
-            m[(sheet, addr)] = val_str
-    return m
-
-
-def _get_val(cell_map: Dict[Tuple[str, str], str], sheet: str, addr: str) -> str:
-    return cell_map.get((sheet, addr.upper()), "")
-
-
-def _extract_name_value_block(
-    cell_map: Dict[Tuple[str, str], str],
+def extract_two_col_rows(
+    cells: Dict[Tuple[str, str], Dict[str, str]],
     sheet: str,
-    left_col: str,
-    right_col: str,
+    name_col: str,
+    value_col: str,
     row_start: int,
     row_end: int,
 ) -> List[Tuple[str, str]]:
+    nc = col_letters_to_num(name_col)
+    vc = col_letters_to_num(value_col)
     out: List[Tuple[str, str]] = []
     for r in range(row_start, row_end + 1):
-        name = _get_val(cell_map, sheet, _a1(left_col, r)).strip()
-        value = _get_val(cell_map, sheet, _a1(right_col, r)).strip()
-        if not name:
+        name = get_value(cells, sheet, a1(r, nc))
+        value = get_value(cells, sheet, a1(r, vc))
+        if (name or "").strip() == "" and (value or "").strip() == "":
             continue
         out.append((name, value))
     return out
 
 
-def _extract_rect(
-    excelcell: pd.DataFrame,
-    sheet: str,
-    col_start: str,
-    col_end: str,
-    row_start: int,
-    row_end: Optional[int] = None,
-) -> pd.DataFrame:
-    """
-    Extract a rectangular area from excelcell as a DataFrame with columns = A..E (or specified range).
-    If row_end is None, extracts all rows >= row_start that have any non-empty value in the selected columns.
-    """
-    df = excelcell[excelcell["Sheet"].astype(str).str.strip() == sheet].copy()
-    if df.empty:
-        cols = [_num_to_col(i) for i in range(_col_to_num(col_start), _col_to_num(col_end) + 1)]
-        return pd.DataFrame(columns=cols)
-
-    parsed = df["Address"].astype(str).str.upper().str.strip().apply(_parse_a1)
-    df["Col"] = parsed.apply(lambda t: t[0])
-    df["Row"] = parsed.apply(lambda t: t[1])
-
-    c0 = _col_to_num(col_start)
-    c1 = _col_to_num(col_end)
-    cols = [_num_to_col(i) for i in range(c0, c1 + 1)]
-
-    df = df[df["Col"].isin(cols)].copy()
-    if row_end is None:
-        df = df[df["Row"] >= row_start].copy()
-    else:
-        df = df[(df["Row"] >= row_start) & (df["Row"] <= row_end)].copy()
-
-    if df.empty:
-        return pd.DataFrame(columns=cols)
-
-    df["ValueStr"] = df["Value"].apply(lambda v: "" if pd.isna(v) else str(v))
-    pivot = df.pivot_table(index="Row", columns="Col", values="ValueStr", aggfunc="first")
-
-    for c in cols:
-        if c not in pivot.columns:
-            pivot[c] = ""
-    pivot = pivot[cols].sort_index()
-
-    pivot = pivot.replace({pd.NA: "", None: ""})
-    nonempty_mask = (pivot.applymap(lambda x: str(x).strip() != "")).any(axis=1)
-    pivot = pivot[nonempty_mask].copy()
-
-    pivot.reset_index(drop=True, inplace=True)
-    pivot.columns.name = None
-    return pivot
+# ----------------------------
+# MortalityTables extraction
+# ----------------------------
+def parse_row_col(addr: str) -> Tuple[int, int]:
+    m = A1_RE.match(addr.strip().upper())
+    if not m:
+        raise ValueError(f"Bad A1: {addr}")
+    col = col_letters_to_num(m.group(1))
+    row = int(m.group(2))
+    return row, col
 
 
-def _extract_mortality_tables_with_row3_headers(excelcell: pd.DataFrame) -> pd.DataFrame:
-    """
-    MortalityTables sheet:
-    - headers in row 3 (A3:E3)
-    - data from row 4 (A4:E...)
-    Output CSV should have those header labels as column names.
-    """
-    header_df = _extract_rect(excelcell, sheet="MortalityTables", col_start="A", col_end="E", row_start=3, row_end=3)
-    data_df = _extract_rect(excelcell, sheet="MortalityTables", col_start="A", col_end="E", row_start=4, row_end=None)
+def extract_mortality_tables(
+    cells: Dict[Tuple[str, str], Dict[str, str]],
+    sheet: str = "MortalityTables",
+    header_row: int = 3,
+    data_row_start: int = 4,
+    col_start: str = "A",
+    col_end: str = "E",
+) -> List[Tuple[str, str]]:
+    c1 = col_letters_to_num(col_start)
+    c2 = col_letters_to_num(col_end)
 
-    cols = ["A", "B", "C", "D", "E"]
-    if header_df.empty:
-        header_labels = cols[:]  # fallback
-    else:
-        row = header_df.iloc[0]
-        header_labels = []
-        for c in cols:
-            lbl = str(row.get(c, "")).strip()
-            header_labels.append(lbl if lbl else c)
+    # headers from row 3
+    headers: List[str] = []
+    for c in range(c1, c2 + 1):
+        h = (get_value(cells, sheet, a1(header_row, c)) or "").strip()
+        headers.append(h if h else f"Col{col_num_to_letters(c)}")
 
-    # Ensure data_df has the A..E columns
-    for c in cols:
-        if c not in data_df.columns:
-            data_df[c] = ""
+    # find max data row that has any non-empty value within A:E
+    max_row = 0
+    for (sh, addr), rec in cells.items():
+        if sh != sheet:
+            continue
+        try:
+            r, c = parse_row_col(addr)
+        except ValueError:
+            continue
+        if r < data_row_start or not (c1 <= c <= c2):
+            continue
+        v = (rec.get("value") or "").strip()
+        f = (rec.get("formula") or "").strip()
+        if v != "" or f != "":
+            max_row = max(max_row, r)
 
-    out = data_df[cols].copy()
-    out.columns = header_labels
+    if max_row < data_row_start:
+        return []
+
+    out: List[Tuple[str, str]] = []
+    for r in range(data_row_start, max_row + 1):
+        row_dict: Dict[str, str] = {}
+        any_nonempty = False
+        first_val = ""
+        for i, c in enumerate(range(c1, c2 + 1)):
+            v = (get_value(cells, sheet, a1(r, c)) or "").strip()
+            row_dict[headers[i]] = v
+            if i == 0:
+                first_val = v
+            if v != "":
+                any_nonempty = True
+
+        if not any_nonempty:
+            continue
+
+        # Stable row key: include first column value if present, else row number
+        key = first_val if first_val else f"ROW{r}"
+        name = f"{key}|{r}"
+        value = json.dumps(row_dict, ensure_ascii=False)
+        out.append((name, value))
 
     return out
 
 
-def _extract_e12_formula(excelcell: pd.DataFrame) -> Optional[str]:
-    m = excelcell[
-        (excelcell["Sheet"].astype(str).str.strip() == "Calculation")
-        & (excelcell["Address"].astype(str).str.upper().str.strip() == "E12")
-    ]
-    if m.empty:
-        return None
-    f = m.iloc[0].get("Formula", "")
-    if pd.isna(f):
-        return None
-    return str(f)
+# ----------------------------
+# ModalSurcharge extraction & codegen
+# ----------------------------
+E12_PATTERN = re.compile(
+    r"""^=IF\s*\(\s*PayFreq\s*=\s*(\d+)\s*,\s*([\d.]+)%\s*,\s*IF\s*\(\s*PayFreq\s*=\s*(\d+)\s*,\s*([\d.]+)%\s*,\s*IF\s*\(\s*PayFreq\s*=\s*(\d+)\s*,\s*([\d.]+)%\s*,\s*0\s*\)\s*\)\s*\)\s*$""",
+    re.IGNORECASE,
+)
 
 
-def _write_tariff_py(out_path: Path, e12_formula: Optional[str]) -> None:
-    # Keep explicit implementation for now (matches exported Excel formula used in earlier steps)
-    expected = "=IF(PayFreq=2,2%,IF(PayFreq=4,3%,IF(PayFreq=12,5%,0)))"
-    formula_note = (e12_formula or "").strip()
-    if formula_note.startswith("'="):
-        formula_note = formula_note[1:]
+def render_tariff_py_from_e12(e12_formula: str) -> str:
+    """
+    Exact implementation for this workbook's E12 formula:
+      =IF(PayFreq=2,2%,IF(PayFreq=4,3%,IF(PayFreq=12,5%,0)))
+    We generate code directly from the formula, and validate it matches this pattern.
+    """
+    f = (e12_formula or "").strip()
+    if not f:
+        raise ValueError("Missing E12 formula text.")
 
-    code = f'''"""
-tariff.py
+    m = E12_PATTERN.match(f.replace(" ", ""))
+    if not m:
+        # Fallback: keep formula as comment and implement the known behavior only if it matches expected set.
+        # But we fail hard to avoid silent mismatches.
+        raise ValueError(f"Unexpected E12 formula format: {f!r}")
 
-Auto-generated from Excel export.
+    pf1, p1, pf2, p2, pf3, p3 = m.groups()
+    mapping = {
+        int(pf1): float(p1) / 100.0,
+        int(pf2): float(p2) / 100.0,
+        int(pf3): float(p3) / 100.0,
+    }
 
-Source cell:
-- Calculation!E12 formula: {formula_note!r}
+    return f'''"""
+Auto-generated by data_extract.py from excelcell.csv.
 
-Implements:
-- ModalSurcharge(PayFreq)
+Implements ModalSurcharge(PayFreq) exactly as the Excel formula in Calculation!E12:
+  {f}
 """
 
 from __future__ import annotations
 
 
-def ModalSurcharge(PayFreq: int | float) -> float:
+EXCEL_E12_FORMULA = {f!r}
+_MODAL_MAP = {mapping!r}
+
+
+def ModalSurcharge(PayFreq: int) -> float:
     """
-    Port of Excel Calculation!E12.
+    Modal surcharge for payment frequency.
 
-    Excel formula (expected):
-      {expected}
-
-    Returns a modal surcharge (as decimal, e.g. 0.05 == 5%).
+    Mirrors the nested IF in Excel cell Calculation!E12.
     """
     try:
         pf = int(PayFreq)
-    except Exception:
-        pf = int(float(PayFreq))
-
-    if pf == 2:
-        return 0.02
-    if pf == 4:
-        return 0.03
-    if pf == 12:
-        return 0.05
-    return 0.0
+    except Exception as e:
+        raise TypeError("PayFreq must be convertible to int") from e
+    return float(_MODAL_MAP.get(pf, 0.0))
 '''
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(code, encoding="utf-8", newline="\n")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Extract calculator data blocks from excelcell/excelrange CSV exports.")
-    parser.add_argument("--excelcell", type=str, default="", help="Path to excelcell.csv")
-    parser.add_argument("--excelrange", type=str, default="", help="Path to excelrange.csv")
-    parser.add_argument("--outdir", type=str, default="", help="Output directory (defaults to script directory)")
-    args = parser.parse_args()
+# ----------------------------
+# Main
+# ----------------------------
+def main() -> None:
+    excelcell = pick_existing(CANDIDATE_EXCELCELL)
+    excelrange = pick_existing(CANDIDATE_EXCELRANGE)
 
-    excelcell_path = Path(args.excelcell).resolve() if args.excelcell else _default_in_path("excelcell.csv")
-    excelrange_path = Path(args.excelrange).resolve() if args.excelrange else _default_in_path("excelrange.csv")
-    out_dir = Path(args.outdir).resolve() if args.outdir else _script_dir()
+    validate_excelrange(excelrange)
+    cells = load_excelcell(excelcell)
 
-    if not excelcell_path.exists():
-        raise SystemExit(f"ERROR: excelcell.csv not found: {excelcell_path}")
-    if not excelrange_path.exists():
-        raise SystemExit(f"ERROR: excelrange.csv not found: {excelrange_path}")
+    # var.csv: Calculation A4:B9
+    var_rows = extract_two_col_rows(cells, "Calculation", "A", "B", 4, 9)
+    write_name_value(OUT_VAR, var_rows)
 
-    excelcell = pd.read_csv(excelcell_path)
-    _ = pd.read_csv(excelrange_path)  # exists; currently not needed for these blocks
+    # tariff.csv: Calculation D4:E11
+    tariff_rows = extract_two_col_rows(cells, "Calculation", "D", "E", 4, 11)
+    write_name_value(OUT_TARIFF, tariff_rows)
 
-    cell_map = _build_cell_map(excelcell)
+    # limits.csv: Calculation G4:H5
+    limits_rows = extract_two_col_rows(cells, "Calculation", "G", "H", 4, 5)
+    write_name_value(OUT_LIMITS, limits_rows)
 
-    # var.csv – Calculation A4:B9
-    var_rows = _extract_name_value_block(cell_map, "Calculation", "A", "B", 4, 9)
-    _write_csv_rows(out_dir / "var.csv", header=("Name", "Value"), rows=var_rows)
+    # tables.csv: MortalityTables A:E, headers row 3, data from row 4
+    tables_rows = extract_mortality_tables(cells)
+    write_name_value(OUT_TABLES, tables_rows)
 
-    # tariff.csv – Calculation D4:E11
-    tariff_rows = _extract_name_value_block(cell_map, "Calculation", "D", "E", 4, 11)
-    _write_csv_rows(out_dir / "tariff.csv", header=("Name", "Value"), rows=tariff_rows)
+    # tariff.py: ModalSurcharge(PayFreq) from Calculation!E12 formula
+    e12_formula = get_formula(cells, "Calculation", "E12")
+    if not e12_formula.strip():
+        raise ValueError("Could not find Calculation!E12 formula in excelcell.csv (missing or empty Formula column).")
+    OUT_TARIFF_PY.write_text(render_tariff_py_from_e12(e12_formula), encoding="utf-8")
 
-    # limits.csv – Calculation G4:H5
-    limits_rows = _extract_name_value_block(cell_map, "Calculation", "G", "H", 4, 5)
-    _write_csv_rows(out_dir / "limits.csv", header=("Name", "Value"), rows=limits_rows)
+    # Minimal runtime checks (non-fatal prints)
+    def data_rows(p: Path) -> int:
+        with p.open("r", encoding="utf-8-sig", newline="") as f:
+            return max(0, sum(1 for _ in f) - 1)
 
-    # tables.csv – MortalityTables A:E, headers row 3, data from row 4
-    tables_df = _extract_mortality_tables_with_row3_headers(excelcell)
-    (out_dir / "tables.csv").parent.mkdir(parents=True, exist_ok=True)
-    tables_df.to_csv(out_dir / "tables.csv", index=False, encoding="utf-8", lineterminator="\n")
-
-    # tariff.py – ModalSurcharge(PayFreq) from Calculation!E12 formula
-    e12_formula = _extract_e12_formula(excelcell)
-    _write_tariff_py(out_dir / "tariff.py", e12_formula)
-
-    print(f"Wrote: {out_dir / 'var.csv'} ({len(var_rows)} rows)")
-    print(f"Wrote: {out_dir / 'tariff.csv'} ({len(tariff_rows)} rows)")
-    print(f"Wrote: {out_dir / 'limits.csv'} ({len(limits_rows)} rows)")
-    print(f"Wrote: {out_dir / 'tables.csv'} ({len(tables_df)} rows) [headers from MortalityTables row 3]")
-    print(f"Wrote: {out_dir / 'tariff.py'}")
-
-    return 0
+    print(f"Inputs: {excelcell} , {excelrange}")
+    print(f"Wrote {OUT_VAR} rows={data_rows(OUT_VAR)}")
+    print(f"Wrote {OUT_TARIFF} rows={data_rows(OUT_TARIFF)}")
+    print(f"Wrote {OUT_LIMITS} rows={data_rows(OUT_LIMITS)}")
+    print(f"Wrote {OUT_TABLES} rows={data_rows(OUT_TABLES)}")
+    print(f"Wrote {OUT_TARIFF_PY} (ModalSurcharge from Calculation!E12)")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
